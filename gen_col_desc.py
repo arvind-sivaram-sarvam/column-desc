@@ -100,7 +100,7 @@ for _, row in df[df["source_id"] == 1001].iterrows():
     name, description, columns = parse_chunk(chunk)
     if name and description and columns:
         new_column_name = generate_column_description(name, description, columns, metadata)
-        new_data.append({"source_id": source_id, "generated_column_desc": new_column_name})
+        new_data.append({"source_id": source_id, "table_name": name, "metadata": metadata, "column_desc": new_column_name})
 
 new_df = pd.DataFrame(new_data)
 output_path = "/Users/arvindsivaram/column-desc/tmp/new_columns.csv"
