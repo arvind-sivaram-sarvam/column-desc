@@ -92,7 +92,7 @@ def generate_column_description(name, description, columns, metadata): #  no len
     return match.group(1) if match else None
 
 new_data = []
-for _, row in df[df["source_id"] == 1000].iterrows():
+for _, row in df[df["source_id"] == 1001].iterrows():
     source_id = row["source_id"]
     chunk = row["chunk"]
     metadata = row["metadata"]
@@ -103,5 +103,5 @@ for _, row in df[df["source_id"] == 1000].iterrows():
         new_data.append({"source_id": source_id, "generated_column_desc": new_column_name})
 
 new_df = pd.DataFrame(new_data)
-output_path = "/Users/arvindsivaram/column-desc/new_columns.csv"
+output_path = "/Users/arvindsivaram/column-desc/tmp/new_columns.csv"
 new_df.to_csv(output_path, index=False)
