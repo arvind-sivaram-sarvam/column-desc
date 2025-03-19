@@ -7,15 +7,14 @@ import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-
 file_path = "/Users/arvindsivaram/column-desc/NDAP_Data_SourceMaster_1.xlsx"
-df = pd.read_excel(file_path)
-print(f"Logical CPUs: {os.cpu_count()}")
-
 checkpoint_file = "/Users/arvindsivaram/column-desc/checkpoint_results.csv"
 column_desc_checkpoint = "/Users/arvindsivaram/column-desc/column_desc_checkpoint.json"
 
-# Load checkpoint data
+df = pd.read_excel(file_path)
+print(f"Logical CPUs: {os.cpu_count()}")
+
+# Load checkpoint data for grouping results
 if os.path.exists(checkpoint_file):
     checkpoint_df = pd.read_csv(checkpoint_file)
     processed_source_ids = set(checkpoint_df["source_id"].unique())
@@ -25,19 +24,50 @@ else:
     processed_source_ids = set()
     new_data = []
 
+# Load column description cache to skip cols that were processed already
 if os.path.exists(column_desc_checkpoint):
     with open(column_desc_checkpoint, "r") as f:
         column_desc_cache = json.load(f)
+    # Normalize the checkpoint format to be a list of dicts
+    for key in list(column_desc_cache.keys()):
+        value = column_desc_cache[key]
+        if isinstance(value, str):
+            parts = value.split(":", 1)
+            if len(parts) == 2:
+                column_name = parts[0].strip()
+                column_desc = parts[1].strip()
+            else:
+                column_name = value.strip()
+                column_desc = value.strip()
+            column_desc_cache[key] = [{"column_name": column_name, "column_description": column_desc}]
+        elif isinstance(value, list):
+            new_list = []
+            for item in value:
+                if isinstance(item, dict):
+                    new_list.append(item)
+                elif isinstance(item, str):
+                    parts = item.split(":", 1)
+                    if len(parts) == 2:
+                        column_name = parts[0].strip()
+                        column_desc = parts[1].strip()
+                    else:
+                        column_name = item.strip()
+                        column_desc = item.strip()
+                    new_list.append({"column_name": column_name, "column_description": column_desc})
+            column_desc_cache[key] = new_list
 else:
     column_desc_cache = {}
 
-max_threads = 5
+table_info = {}
+max_threads = 6
+batch_size = 12
 api_semaphore = threading.Semaphore(max_threads)
+lock = threading.Lock()
 
 def parse_chunk(chunk):
+    """Parses the chunk text to extract table name, table description and list of columns."""
     name, description, columns = "", "", []
     lines = chunk.strip().split("\n")
-    
     current_section = None
     for line in lines:
         if line.startswith("Name:"):
@@ -55,36 +85,31 @@ def parse_chunk(chunk):
                 name += " " + line.strip()
             elif current_section == "description" and not line.startswith("Columns:"):
                 description += " " + line.strip()
-    
     return name.strip(), description.strip(), columns
 
 def generate_column_description(name, description, column, metadata):
     prompt = f"""
     You are a summarization expert, capable of consuming multiple sources of information and describing their features and usage 
     in the given context. You are provided with a table name, table description, column name and associated metadata. Your task is to 
-    generate a column description, which accurately reflects the data in the column as well as its purpose. Here are some guidelines 
-    to note:
-
-    - You must only use the provided information to generate your description
-    - You must not change the column names in any way. They should appear in your output as they do in the input.
-    - The column description must be accurate keeping in mind the column in the context of the entire table and the provided metadata. 
-    - The column description's should be made in such a way that there is a value-add when a person is provided with
-    just the column description, versus being provided with the table description, column name and metadata.
-    - The column description must balance retaining all pertinent information while also not being unnecessarily long.
-
-    You are provided with only the below information to create the column description:
-
+    generate a column description, which accurately reflects the data in the column as well as its purpose. Here are some guidelines:
+    
+    - Use only the provided information.
+    - Do not change the column name.
+    - The description must accurately reflect the column in context.
+    - The description should add value beyond the basic metadata.
+    - Balance between conciseness and completeness.
+    
+    Provided Information:
     - Table Name: {name}
     - Description: {description}
     - Column: {column}
     - Metadata: {metadata}
-
-    Enclose the final column description in the following format @COLUMN_NAME: COLUMN_DESCRIPTION@
+    
+    Enclose the final column description in the format @COLUMN_NAME: COLUMN_DESCRIPTION@
     """
     
     max_retries = 5
     retry_delay = 20  
-
     for attempt in range(max_retries):
         try:
             with api_semaphore:
@@ -92,15 +117,12 @@ def generate_column_description(name, description, column, metadata):
                     model="claude-3-5-sonnet-20241022",
                     messages=[{"role": "user", "content": prompt}]
                 ).choices[0].message.content
-            
             match = re.search(r'@(.*?)@', response)
             return match.group(1) if match else None
-        
         except Exception as e:
             print(f"API Error: {e} | Retrying in {retry_delay} seconds... (Attempt {attempt+1}/{max_retries})")
             time.sleep(retry_delay)
             retry_delay *= 2  
-
     print("Failed after multiple retries.")
     return None
 
@@ -118,10 +140,8 @@ def group_columns_by_relevance(source_id, table_name, column_descriptions, max_g
     
     Columns and Descriptions:
     """
-    
     for col_desc in column_descriptions:
         prompt += f"\n- {col_desc}"
-    
     prompt += """
     
     Do not provide any additional explanation in the answer.
@@ -129,92 +149,123 @@ def group_columns_by_relevance(source_id, table_name, column_descriptions, max_g
     Below is the sample format you should stick to:
     [
         {
-            "source_id": {source_id},
-            "grouping": "(basis for grouping)",
+            "source_id": <source_id>,
+            "grouping": "<basis for grouping>",
             "grouped_columns": [
-    {"column_name": "Column1", "column_description": "Description of Column1"},
-    {"column_name": "Column2", "column_description": "Description of Column2"}
-]
+                {"column_name": "Column1", "column_description": "Description1"},
+                {"column_name": "Column2", "column_description": "Description2"}
+            ]
         }
     ]
     """
     
     max_retries = 5
     retry_delay = 20
-
     for attempt in range(max_retries):
         try:
-            response = completion(
-                model="claude-3-5-sonnet-20241022",
-                messages=[{"role": "user", "content": prompt}]
-            ).choices[0].message.content
-
+            with api_semaphore:
+                response = completion(
+                    model="claude-3-5-sonnet-20241022",
+                    messages=[{"role": "user", "content": prompt}]
+                ).choices[0].message.content
             return json.loads(response)
-
         except Exception as e:
             print(f"Grouping API Error: {e} | Retrying in {retry_delay} seconds... (Attempt {attempt+1}/{max_retries})")
             time.sleep(retry_delay)
             retry_delay *= 2 
-
     print("Grouping failed after multiple retries.")
     return []
 
-counter = 0
-for source_id, group in df.groupby("source_id"):
-    if source_id in processed_source_ids:
-        print(f"Skipping {source_id}, already processed.")
-        continue
+try:
+    batch_executor = ThreadPoolExecutor(max_workers=max_threads)
+    batch_futures = []
+    total_rows = len(df)
+    batch_counter = 0
 
-    print(f"Running for Table {source_id}")
-    column_descriptions = column_desc_cache.get(str(source_id), [])
-    name, description = "", ""
-
-    for _, row in group.iterrows():
-        chunk = row["chunk"]
-        metadata = row["metadata"]
-        name, description, columns = parse_chunk(chunk)
-
-        if name and description and columns:
-            remaining_columns = [col for col in columns if col not in [desc.split(":")[0] for desc in column_descriptions]]
-
-            with ThreadPoolExecutor(max_workers=max_threads) as executor:
-                future_to_column = {
-                    executor.submit(generate_column_description, name, description, column, metadata): column
-                    for column in remaining_columns
-                }
-
-                for future in as_completed(future_to_column):
-                    column = future_to_column[future]
-                    col_desc = future.result()
-                    if col_desc:
-                        column_descriptions.append(col_desc)
-
-
-            column_desc_cache[str(source_id)] = column_descriptions
+    for i in range(0, total_rows, batch_size):
+        
+        batch_df = df.iloc[i:i+batch_size]
+        batch_entries = []
+        for idx, row in batch_df.iterrows():
+            source_id = row["source_id"]
+            chunk = row["chunk"]
+            metadata = row["metadata"]
+            table_name, table_desc, columns = parse_chunk(chunk)
+            with lock:
+                if source_id not in table_info:
+                    table_info[source_id] = {"table_name": table_name, "description": table_desc, "metadata": metadata}
+            with lock:
+                processed_columns = set()
+                if str(source_id) in column_desc_cache:
+                    processed_columns = {item["column_name"] for item in column_desc_cache[str(source_id)]}
+            for col in columns:
+                if col not in processed_columns:
+                    batch_entries.append({
+                        "source_id": source_id,
+                        "table_name": table_name,
+                        "description": table_desc,
+                        "column": col,
+                        "metadata": metadata
+                    })
+        if batch_entries:
+            future = batch_executor.submit(
+                lambda entries=batch_entries: [
+                    {
+                        "source_id": entry["source_id"],
+                        "table_name": entry["table_name"],
+                        "column_name": entry["column"],
+                        "column_description": generate_column_description(
+                            entry["table_name"], entry["description"], entry["column"], entry["metadata"]
+                        )
+                    }
+                    for entry in entries
+                ]
+            )
+            batch_futures.append((future, len(batch_entries)))
+        batch_counter += 1
+        # Sleep briefly to avoid overloading the LLM
+        time.sleep(1)
+        if batch_counter % 10 == 0:
+            for future in as_completed([f for f, cnt in batch_futures]):
+                try:
+                    results = future.result()
+                    with lock:
+                        for res in results:
+                            src = str(res["source_id"])
+                            if src not in column_desc_cache:
+                                column_desc_cache[src] = []
+                            if not any(item["column_name"] == res["column_name"] for item in column_desc_cache[src]):
+                                column_desc_cache[src].append({
+                                    "column_name": res["column_name"],
+                                    "column_description": res["column_description"]
+                                })
+                except Exception as e:
+                    print(f"Error processing future result: {e}")
+            batch_futures = [(f, cnt) for f, cnt in batch_futures if not f.done()]
             with open(column_desc_checkpoint, "w") as f:
                 json.dump(column_desc_cache, f)
-    
-    if column_descriptions:
-        time.sleep(1)
-        grouped_columns_list = group_columns_by_relevance(source_id, name, column_descriptions, max_group_size=20)
-        for grouping in grouped_columns_list:
-            chunk_content = "Columns:\n" + "\n".join(
-                [f"- {col['column_name']}: {col['column_description']}" for col in grouping.get("grouped_columns", [])]
-            )
-            new_data.append({
-                "source_id": source_id,
-                "chunk": chunk_content,
-                "metadata": row["metadata"]
-            })
-
-    if (counter % 10 == 0):
-        temp_df = pd.DataFrame(new_data)
-        temp_df.to_csv(checkpoint_file, index=False)
-        temp_df.to_excel("/Users/arvindsivaram/column-desc/tmp/checkpoint_results.xlsx", index=False)
-        print(f"Checkpoint saved: {len(new_data)} rows processed.")
-    print(f"Finished Table {source_id}")
-    counter += 1
-
-new_df = pd.DataFrame(new_data)
-output_path = "/Users/arvindsivaram/column-desc/tmp/grouped_columns.xlsx"
-new_df.to_excel(output_path, index=False)
+            print(f"Checkpoint after processing {i+batch_size} rows.")
+    # Wait for any remaining futures
+    for future in as_completed([f for f, cnt in batch_futures]):
+        try:
+            results = future.result()
+            with lock:
+                for res in results:
+                    src = str(res["source_id"])
+                    if src not in column_desc_cache:
+                        column_desc_cache[src] = []
+                    if not any(item["column_name"] == res["column_name"] for item in column_desc_cache[src]):
+                        column_desc_cache[src].append({
+                            "column_name": res["column_name"],
+                            "column_description": res["column_description"]
+                        })
+        except Exception as e:
+            print(f"Error in final future processing: {e}")
+    batch_executor.shutdown(wait=True)
+    with open(column_desc_checkpoint, "w") as f:
+        json.dump(column_desc_cache, f)
+    print("Finished processing all batches for column descriptions.")
+except KeyboardInterrupt:
+    print("Interrupted during batch processing. Shutting down executor.")
+    batch_executor.shutdown(wait=False)
+    exit(1)
