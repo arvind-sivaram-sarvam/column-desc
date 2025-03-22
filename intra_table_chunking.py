@@ -7,16 +7,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from litellm import completion
 import threading
 
-# Paths for input and output.
-input_excel = "/Users/arvindsivaram/column-desc/source_master_with_desc.xlsx"
-grouping_checkpoint_file = "/Users/arvindsivaram/column-desc/final_grouping_checkpoint.csv"
-final_output_file = "/Users/arvindsivaram/column-desc/tmp/final_grouped_columns.xlsx"
+input_excel = "/Users/arvindsivaram/column-desc/augmented_input.xlsx"
+grouping_checkpoint_file = "/Users/arvindsivaram/column-desc/keyed_grouping_checkpoint2.csv"
+final_output_file = "/Users/arvindsivaram/column-desc/tmp/keyed_grouped_columns2.xlsx"
 
-# Load the input sheet (each row corresponds to one column in a table).
 df = pd.read_excel(input_excel)
 
-# Load existing grouping checkpoint if it exists using default CSV parameters.
-# IMPORTANT: If you are switching to new UID-only logic, you should clear your checkpoint CSV to re-process all tables.
+# pick up from checkpoint, if it exists
 if os.path.exists(grouping_checkpoint_file):
     try:
         checkpoint_df = pd.read_csv(grouping_checkpoint_file)
@@ -31,53 +28,30 @@ else:
     processed_source_ids = set()
     new_data = []
 
-# Lock for thread safety during file writes.
 lock = threading.Lock()
 
-def parse_chunk(chunk):
-    """
-    Parse the chunk field to extract table name, table description, and the column names.
-    For this sheet, each chunk contains one column under "Columns:".
-    """
-    name, description, columns = "", "", []
-    lines = chunk.strip().split("\n")
-    current_section = None
-    for line in lines:
-        if line.startswith("Name:"):
-            current_section = "name"
-            name += line.replace("Name:", "").strip()
-        elif line.startswith("Description:"):
-            current_section = "description"
-            description = line.replace("Description:", "").strip()
-        elif line.startswith("Columns:"):
-            current_section = "columns"
-        elif re.match(r"^- ", line) and current_section == "columns":
-            # Only remove the leading bullet marker, keeping internal hyphens intact.
-            columns.append(re.sub(r"^- ", "", line, count=1).strip())
-        else:
-            if current_section == "name":
-                name += " " + line.strip()
-            elif current_section == "description" and not line.startswith("Columns:"):
-                description += " " + line.strip()
-    return name.strip(), description.strip(), columns
-
-# Ensure each row gets a UID (using row index if not already present).
-if "uid" not in df.columns:
-    df["uid"] = df.index.astype(str)
-
-# Group rows by source_id.
+# group each source id
 grouped_columns = {}
-table_info = {}  # For each source_id, store table name and metadata.
+table_info = {}
 for idx, row in df.iterrows():
-    src = str(row["source_id"])
-    table_name, table_desc, cols = parse_chunk(row["chunk"])
-    col_name = cols[0].strip() if cols else ""
+    src = str(row["source_id"])  
+    table_name = row["table_name"]
+    table_desc = row["table_desc"] 
     if src not in table_info:
         table_info[src] = {"table_name": table_name, "metadata": row["metadata"]}
-    col_item = {"uid": row["uid"], "column_name": col_name, "column_description": row["column_description"].strip()}
+    col_desc = row["column_desc"]
+    if isinstance(col_desc, str):
+        col_desc = col_desc.strip()
+    else:
+        col_desc = ""
+    col_item = {
+        "uid": row["uid"],
+        "column_name": row["column_name"],
+        "column_description": col_desc
+    }
     grouped_columns.setdefault(src, []).append(col_item)
 
-# Remove duplicate columns (by UID) for each source id.
+# remove duplicate columns (by UID) for each source_id.
 for src in grouped_columns:
     seen = set()
     unique_list = []
@@ -87,7 +61,6 @@ for src in grouped_columns:
             seen.add(item["uid"])
     grouped_columns[src] = unique_list
 
-# Use a semaphore for limiting concurrent API calls.
 max_threads = 6
 api_semaphore = threading.Semaphore(max_threads)
 
@@ -127,7 +100,7 @@ Do not include any extra commentary.
                     model="claude-3-5-sonnet-20241022",
                     messages=[{"role": "user", "content": prompt}]
                 ).choices[0].message.content
-            time.sleep(1)  # Short sleep to help avoid rate limits.
+            time.sleep(1) 
             groups = json.loads(response)
             return groups
         except Exception as e:
@@ -138,9 +111,6 @@ Do not include any extra commentary.
     return None
 
 def update_checkpoint(new_groupings, checkpoint_file):
-    """
-    Append new grouping results to the checkpoint file in a thread-safe manner.
-    """
     with lock:
         if os.path.exists(checkpoint_file) and os.path.getsize(checkpoint_file) > 0:
             try:
@@ -153,20 +123,18 @@ def update_checkpoint(new_groupings, checkpoint_file):
         combined_data = existing_data + new_groupings
         temp_df = pd.DataFrame(combined_data)
         temp_df.to_csv(checkpoint_file, index=False)
-        # Also write an Excel checkpoint file.
-        checkpoint_excel = os.path.join(os.path.dirname(checkpoint_file), "checkpoint_results.xlsx")
-        temp_df.to_excel(checkpoint_excel, index=False)
         print(f"Checkpoint updated: {len(combined_data)} rows processed.")
 
-# Process grouping tasks concurrently.
+# list of source ids which need to be processed again/for the first time
 all_source_ids = sorted(grouped_columns.keys(), key=lambda x: int(x) if x.isdigit() else x)
 pending_ids = [src for src in all_source_ids if src not in processed_source_ids]
 print(f"Total source_ids to process: {len(pending_ids)}")
 
-final_groupings = []  # Accumulate final grouping results.
+final_groupings = []
 processed_count = 0
 failed_source_ids = []
 
+# multithreaded approach for getting multiple source ids
 with ThreadPoolExecutor(max_workers=max_threads) as executor:
     future_to_src = {}
     for src in pending_ids:
@@ -185,17 +153,18 @@ with ThreadPoolExecutor(max_workers=max_threads) as executor:
                 print(f"No grouping result for source_id {src}.")
                 failed_source_ids.append(src)
             else:
-                # Use a set to track UIDs already assigned for this source.
                 assigned_uids = set()
                 for grouping in groups:
                     filtered_columns = []
-                    # Process the returned UIDs from the LLM.
                     for uid in grouping.get("grouped_uids", []):
                         if uid in assigned_uids:
                             continue
                         assigned_uids.add(uid)
-                        # Look up the full column information using the UID.
-                        original = next((item for item in grouped_columns[src] if item["uid"] == uid), None)
+                        original = next(
+                                (item for item in grouped_columns[src] 
+                                if str(item["uid"]).strip() == str(uid).strip()),
+                                None
+                            )
                         if original:
                             filtered_columns.append({
                                 "uid": original["uid"],
@@ -210,8 +179,11 @@ with ThreadPoolExecutor(max_workers=max_threads) as executor:
                             })
                     if filtered_columns:
                         chunk_text = "Columns:\n" + "\n".join(
-                            [f"- {item['column_name']}: {item['column_description']}" for item in filtered_columns]
+                            [f"- {item['column_name']} --> {item['column_description']}" for item in filtered_columns]
                         )
+                        # chunk_text = "Columns:\n" + "\n".join(
+                        #     [f"- Column Name: {item['column_name']}, Column Description: {item['column_description']}" for item in filtered_columns]
+                        # )
                         final_groupings.append({
                             "source_id": src,
                             "chunk": chunk_text,
@@ -220,7 +192,6 @@ with ThreadPoolExecutor(max_workers=max_threads) as executor:
                 processed_source_ids.add(src)
                 print(f"Processed grouping for source_id {src}.")
             processed_count += 1
-            # Update checkpoint every 10 processed source_ids.
             if processed_count % 10 == 0:
                 update_checkpoint(final_groupings, grouping_checkpoint_file)
                 final_groupings = []  # Clear after checkpointing.
@@ -230,17 +201,18 @@ with ThreadPoolExecutor(max_workers=max_threads) as executor:
 
 print(f"Failed source IDs: {failed_source_ids}")
 
-# After processing, update with any remaining groupings.
 if final_groupings:
     new_data.extend(final_groupings)
     update_checkpoint(final_groupings, grouping_checkpoint_file)
 
-# Finalize by writing the complete output.
 if os.path.exists(grouping_checkpoint_file) and os.path.getsize(grouping_checkpoint_file) > 0:
     existing_df = pd.read_csv(grouping_checkpoint_file)
-    existing_df = existing_df.sort_values(by="source_id", key=lambda x: x.astype(int))
+    try:
+        existing_df = existing_df.sort_values(by="source_id", key=lambda x: x.astype(int))
+    except Exception as e:
+        print("Sorting source_id as int failed, sorting as string:", e)
+        existing_df = existing_df.sort_values(by="source_id")
     existing_df.to_csv(grouping_checkpoint_file, index=False)
-    existing_df.to_excel(os.path.join(os.path.dirname(grouping_checkpoint_file), "checkpoint_results.xlsx"), index=False)
     existing_df.to_excel(final_output_file, index=False)
     print(f"Final grouping checkpoint saved: {len(existing_df)} rows processed.")
     print(f"Final grouped output written to {final_output_file}.")

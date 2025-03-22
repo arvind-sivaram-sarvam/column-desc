@@ -1,2 +1,4 @@
 .env
 tmp/*
+split_csvs.py
+kb_create.py
