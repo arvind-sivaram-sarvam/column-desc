@@ -2,3 +2,4 @@
 tmp/*
 split_csvs.py
 kb_create.py
+.DS_Store
