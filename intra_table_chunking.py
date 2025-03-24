@@ -7,9 +7,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from litellm import completion
 import threading
 
-input_excel = "/Users/arvindsivaram/column-desc/augmented_input.xlsx"
-grouping_checkpoint_file = "/Users/arvindsivaram/column-desc/keyed_grouping_checkpoint2.csv"
-final_output_file = "/Users/arvindsivaram/column-desc/tmp/keyed_grouped_columns2.xlsx"
+input_excel = "/Users/arvindsivaram/column-desc/g1_with_column_id_and_desc.xlsx"
+grouping_checkpoint_file = "/Users/arvindsivaram/column-desc/g1_grouping_checkpoint.csv"
+final_output_file = "/Users/arvindsivaram/column-desc/tmp/g1_grouped_with_column_id.xlsx"
 
 df = pd.read_excel(input_excel)
 
@@ -46,6 +46,7 @@ for idx, row in df.iterrows():
         col_desc = ""
     col_item = {
         "uid": row["uid"],
+        "column_id": row["column_id"],
         "column_name": row["column_name"],
         "column_description": col_desc
     }
@@ -168,12 +169,14 @@ with ThreadPoolExecutor(max_workers=max_threads) as executor:
                         if original:
                             filtered_columns.append({
                                 "uid": original["uid"],
+                                "column_id": original["column_id"],
                                 "column_name": original["column_name"],
                                 "column_description": original["column_description"]
                             })
                         else:
                             filtered_columns.append({
                                 "uid": uid,
+                                "column_id": "",
                                 "column_name": "",
                                 "column_description": ""
                             })
@@ -187,6 +190,7 @@ with ThreadPoolExecutor(max_workers=max_threads) as executor:
                         final_groupings.append({
                             "source_id": src,
                             "chunk": chunk_text,
+                            "column_list": [item['column_id'] for item in filtered_columns],
                             "metadata": table_info[src]["metadata"]
                         })
                 processed_source_ids.add(src)
